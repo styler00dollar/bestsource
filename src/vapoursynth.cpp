@@ -122,7 +122,7 @@ static const VSFrame *VS_CC BestVideoSourceGetFrame(int n, int ActivationReason,
         // https://github.com/vapoursynth/bestsource/commit/48b7729787030af24796329afed7fbb0bd8e4660
         int64_t AbsNum = VP.TimeBase.Num;
         int64_t AbsDen = VP.TimeBase.Den;
-        vsh::muldivRational(&AbsNum, &AbsDen, Src->Pts, 1);
+        vsh::muldivRational(&AbsNum, &AbsDen, Src->PTS, 1);
         vsapi->mapSetFloat(Props, "_AbsoluteTime", static_cast<double>(AbsNum) / AbsDen, maAppend);
         return Dst;
     }
