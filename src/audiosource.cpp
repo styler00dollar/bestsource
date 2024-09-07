@@ -400,8 +400,10 @@ BestAudioSource::BestAudioSource(const std::filesystem::path &SourceFile, int Tr
         if (!IndexTrack(Progress))
             throw BestSourceException("Indexing of '" + Source.u8string() + "' track #" + std::to_string(AudioTrack) + " failed");
 
-        if (CacheMode == bcmAlwaysWrite || (CacheMode == bcmAuto && TrackIndex.Frames.size() >= 100))
-            WriteAudioTrackIndex(CachePath);
+        if (CacheMode == bcmAlwaysWrite || (CacheMode == bcmAuto && TrackIndex.Frames.size() >= 100)) {
+            if (!WriteAudioTrackIndex(CachePath))
+                throw BestSourceException("Failed to write index to '" + CachePath.u8string() + "' for track #" + std::to_string(AudioTrack));
+        }
     }
 
     AP.NumFrames = TrackIndex.Frames.size();
@@ -994,6 +996,8 @@ void BestAudioSource::GetPackedAudio(uint8_t *Data, int64_t Start, int64_t Count
 
     for (int64_t i = Range.First; i <= Range.Last; i++) {
         std::unique_ptr<BestAudioFrame> F(GetFrame(i));
+        if (!F)
+            throw BestSourceException("Audio decoding error, failed to get frame " + std::to_string(i));
         FillInFramePacked(F.get(), Range.FirstSamplePos, Data, Start, Count);
         Range.FirstSamplePos += F->NumSamples;
     }
