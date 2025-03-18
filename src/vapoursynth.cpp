@@ -116,7 +116,14 @@ static const VSFrame *VS_CC BestVideoSourceGetFrame(int n, int ActivationReason,
             [Props, vsapi](const char *Name, int64_t V) { vsapi->mapSetInt(Props, Name, V, maAppend); },
             [Props, vsapi](const char *Name, double V) { vsapi->mapSetFloat(Props, Name, V, maAppend); },
             [Props, vsapi](const char *Name, const char *V, int Size, bool Utf8) { vsapi->mapSetData(Props, Name, V, Size, Utf8 ? dtUtf8 : dtBinary, maAppend); });
-
+        
+        // Adding back _AbsoluteTime
+        // https://github.com/vapoursynth/bestsource/commit/48b7729787030af24796329afed7fbb0bd8e4660
+        const LWVideoProperties &VP = D->V->GetVideoProperties();
+        int64_t AbsNum = VP.TimeBase.Num;
+        int64_t AbsDen = VP.TimeBase.Den;
+        vsh::muldivRational(&AbsNum, &AbsDen, Src->PTS, 1);
+        vsapi->mapSetFloat(Props, "_AbsoluteTime", static_cast<double>(AbsNum) / AbsDen, maAppend);
         return Dst;
     }
 
