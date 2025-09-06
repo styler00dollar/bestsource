@@ -192,7 +192,7 @@ void LWVideoDecoder::OpenFile(const std::filesystem::path &SourceFile, const std
         for (int i = 0;; i++) {
             const AVCodecHWConfig *Config = avcodec_get_hw_config(Codec, i);
             if (!Config)
-                throw BestSourceException("Decoder " + std::string(Codec->name) + " does not support device type " + av_hwdevice_get_type_name(Type));
+                throw BestSourceHWDecoderException("Decoder " + std::string(Codec->name) + " does not support device type " + av_hwdevice_get_type_name(Type));
             if (Config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
                 Config->device_type == Type) {
                 hw_pix_fmt = Config->pix_fmt;
@@ -247,8 +247,10 @@ void LWVideoDecoder::OpenFile(const std::filesystem::path &SourceFile, const std
     if (IsLayered)
         av_dict_set(&CodecDict, "view_ids", std::to_string(ViewID).c_str(), 0);
 
-    if (avcodec_open2(CodecContext, Codec, &CodecDict) < 0)
+    if (avcodec_open2(CodecContext, Codec, &CodecDict) < 0) {
+        av_dict_free(&CodecDict);
         throw BestSourceException("Could not open video codec");
+    }
 
     av_dict_free(&CodecDict);
 
@@ -953,7 +955,13 @@ BestVideoSource::BestVideoSource(const std::filesystem::path &SourceFile, const 
 
     if (TrackIndex.Frames[0].RepeatPict < 0)
         throw BestSourceException("Found an unexpected RFF quirk, please submit a bug report and attach the source file");
-;
+    
+    for (const auto &Iter : TrackIndex.Frames) {
+        if (Iter.PTS == AV_NOPTS_VALUE) {
+            CanSeekByTime = false;
+            break;
+        }
+    }
 
     // Framerate and last frame duration guessing fun
     const auto OriginalFPS = VP.FPS;
@@ -982,7 +990,8 @@ BestVideoSource::BestVideoSource(const std::filesystem::path &SourceFile, const 
         LastFrameDuration = MostCommonDuration.first;
     LastFrameDuration = std::max<int64_t>(1, LastFrameDuration);
 
-    VP.Duration = (TrackIndex.Frames.back().PTS - TrackIndex.Frames.front().PTS) + LastFrameDuration;
+    if (TrackIndex.Frames.front().PTS != AV_NOPTS_VALUE && TrackIndex.Frames.back().PTS != AV_NOPTS_VALUE)
+        VP.Duration = (TrackIndex.Frames.back().PTS - TrackIndex.Frames.front().PTS) + LastFrameDuration;
     
     if (DurationHistogram.size() == 1 && MostCommonDuration.first > 0) {
         // It's true CFR so make sure the frame rate matches the frame durations
@@ -1052,12 +1061,14 @@ bool BestVideoSource::IndexTrack(const ProgressFunction &Progress) {
     TrackIndex.LastFrameDuration = 0;
     bool HasKeyFrames = false;
     bool HasEarlyKeyFrames = false;
+    bool HasValidPTS = false;
 
     while (true) {
         AVFrame *F = Decoder->GetNextFrame();
         if (!F)
             break;
 
+        HasValidPTS = HasValidPTS || (F->pts != AV_NOPTS_VALUE);
         HasKeyFrames = HasKeyFrames || !!(F->flags & AV_FRAME_FLAG_KEY);
         if (TrackIndex.Frames.size() < 100)
             HasEarlyKeyFrames = HasKeyFrames;
@@ -1081,6 +1092,15 @@ bool BestVideoSource::IndexTrack(const ProgressFunction &Progress) {
                 Iter.KeyFrame = true;
         } else if (!HasEarlyKeyFrames) {
             BSDebugPrint("No keyframes found in the first 100 frames when indexing, this may or may not cause performance problems when seeking");
+        }
+    }
+
+    if (!HasValidPTS) {
+        // Probably H264 in AVI
+        if (VP.Duration == TrackIndex.Frames.size()) {
+            // It's CFR so we know every frame duration is 1 unit
+            for (size_t i = 0; i < TrackIndex.Frames.size(); i++)
+                TrackIndex.Frames[i].PTS = i;
         }
     }
 
@@ -1133,7 +1153,7 @@ void BestVideoSource::SetLinearMode() {
         BSDebugPrint("Linear mode is now forced");
         LinearMode = true;
         FrameCache.Clear();
-        for (size_t i = 0; i < MaxVideoSources; i++)
+        for (size_t i = 0; i < MaxVideoDecoders; i++)
             Decoders[i].reset();
     }
 }
@@ -1162,11 +1182,11 @@ namespace {
             Data.push_back(std::make_pair(F, GetHash(F)));
         }
 
-        size_t size() {
+        [[nodiscard]] size_t size() {
             return Data.size();
         }
 
-        size_t empty() {
+        [[nodiscard]] bool empty() {
             return Data.empty();
         }
 
@@ -1329,7 +1349,7 @@ BestVideoFrame *BestVideoSource::GetFrameInternal(int64_t N) {
         return GetFrameLinearInternal(N);
 
     // # 1 A suitable linear decoder exists and seeking is out of the question
-    for (int i = 0; i < MaxVideoSources; i++) {
+    for (int i = 0; i < MaxUsedVideoDecoders; i++) {
         if (Decoders[i] && Decoders[i]->GetFrameNumber() <= N && Decoders[i]->GetFrameNumber() >= SeekFrame)
             return GetFrameLinearInternal(N);
     }
@@ -1339,7 +1359,7 @@ BestVideoFrame *BestVideoSource::GetFrameInternal(int64_t N) {
     // Grab/create a new decoder to use for seeking, the position is irrelevant
     int EmptySlot = -1;
     int LeastRecentlyUsed = 0;
-    for (int i = 0; i < MaxVideoSources; i++) {
+    for (int i = 0; i < MaxUsedVideoDecoders; i++) {
         if (!Decoders[i])
             EmptySlot = i;
         if (Decoders[i] && DecoderLastUse[i] < DecoderLastUse[LeastRecentlyUsed])
@@ -1361,7 +1381,7 @@ BestVideoFrame *BestVideoSource::GetFrameLinearInternal(int64_t N, int64_t SeekF
     int Index = -1;
     int EmptySlot = -1;
     int LeastRecentlyUsed = 0;
-    for (int i = 0; i < MaxVideoSources; i++) {
+    for (int i = 0; i < MaxUsedVideoDecoders; i++) {
         if (Decoders[i] && (!ForceUnseeked || !Decoders[i]->HasSeeked()) && Decoders[i]->GetFrameNumber() <= N && (Index < 0 || Decoders[Index]->GetFrameNumber() < Decoders[i]->GetFrameNumber()))
             Index = i;
         if (!Decoders[i])
@@ -1545,6 +1565,9 @@ BestVideoFrame *BestVideoSource::GetFrameWithRFF(int64_t N, bool Linear) {
 }
 
 BestVideoFrame *BestVideoSource::GetFrameByTime(double Time, bool Linear) {
+    if (!CanSeekByTime)
+        throw BestSourceException("Can't get frame by time, file has frames with unknown timestamps");
+
     int64_t PTS = static_cast<int64_t>(((Time * VP.TimeBase.Den) / VP.TimeBase.Num) + .001);
     FrameInfo F{ PTS };
 
@@ -1793,7 +1816,7 @@ void BestVideoSource::WriteTimecodes(const std::filesystem::path &TimecodeFile) 
 
     fprintf(F.get(), "# timecode format v2\n");
     for (const auto &Iter : TrackIndex.Frames) {
-        double timestamp = (Iter.PTS * VP.TimeBase.Num) / (double)VP.TimeBase.Den;
+        double timestamp = ((Iter.PTS * VP.TimeBase.Num) / (double)VP.TimeBase.Den) * 1000;
 #ifdef __cpp_lib_to_chars
         char buffer[100];
         auto res = std::to_chars(buffer, buffer + sizeof(buffer), timestamp, std::chars_format::fixed, 2);
@@ -1810,4 +1833,14 @@ const BestVideoSource::FrameInfo &BestVideoSource::GetFrameInfo(int64_t N) const
 
 bool BestVideoSource::GetLinearDecodingState() const {
     return LinearMode;
+}
+
+int BestVideoSource::SetMaxDecoderInstances(int NumInstances) {
+    if (NumInstances < 1 || NumInstances > MaxVideoDecoders)
+        MaxUsedVideoDecoders = MaxVideoDecoders;
+    else
+        MaxUsedVideoDecoders = NumInstances;
+    for (int i = NumInstances; i < MaxVideoDecoders; i++)
+        Decoders[i].reset();
+    return MaxUsedVideoDecoders;
 }

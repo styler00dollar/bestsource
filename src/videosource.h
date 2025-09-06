@@ -252,7 +252,7 @@ private:
         };
 
         size_t Size = 0;
-        size_t MaxSize = 1024 * 1024 * 1024;
+        size_t MaxSize = 100 * 1024 * 1024;
         std::list<CacheBlock> Data;
         void ApplyMaxSize();
     public:
@@ -274,7 +274,8 @@ private:
     std::vector<FormatSet> FormatSets;
     FormatSet DefaultFormatSet;
 
-    static constexpr int MaxVideoSources = 4;
+    static constexpr int MaxVideoDecoders = 4;
+    int MaxUsedVideoDecoders = MaxVideoDecoders;
     std::map<std::string, std::string> LAVFOptions;
     BSVideoProperties VP = {};
     std::filesystem::path Source;
@@ -284,10 +285,11 @@ private:
     int VariableFormat = -1;
     int ViewID;
     int Threads;
+    bool CanSeekByTime = true;
     bool LinearMode = false;
     uint64_t DecoderSequenceNum = 0;
-    uint64_t DecoderLastUse[MaxVideoSources] = {};
-    std::unique_ptr<LWVideoDecoder> Decoders[MaxVideoSources];
+    uint64_t DecoderLastUse[MaxVideoDecoders] = {};
+    std::unique_ptr<LWVideoDecoder> Decoders[MaxVideoDecoders];
     int64_t PreRoll = 20;
     int64_t FileSize = -1;
     static constexpr size_t RetrySeekAttempts = 10;
@@ -316,6 +318,7 @@ public:
     void WriteTimecodes(const std::filesystem::path &TimecodeFile) const;
     [[nodiscard]] const FrameInfo &GetFrameInfo(int64_t N) const;
     [[nodiscard]] bool GetLinearDecodingState() const;
+    int SetMaxDecoderInstances(int NumInstances); /* Default value is MaxVideoDecoders */
 };
 
 #endif

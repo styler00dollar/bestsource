@@ -37,6 +37,7 @@ ninja -C build install
 
 - Seeking performance in mpeg/ts/vob files can be quite poor due to the FFmpeg demuxer
 - VC1 codec is unseekable due to FFmpeg not having bitexact output after seeking
+- The unholy combination of VFR H264 in AVI has poor seeking performance
 - Needs FFmpeg compiled with Little CMS2 or the color information reported for most image files will be less complete
 - Mod files can't be decoded correctly using libmodplug due to the library not having repeatable bitexact output
 - Gray+alpha format isn't supported in Avisynth+ and as a result only the Y component is returned
@@ -44,9 +45,9 @@ ninja -C build install
 
 ## VapourSynth usage
 
-`bs.AudioSource(string source[, int track = -1, int adjustdelay = -1, int threads = 0, bint enable_drefs = False, bint use_absolute_path = False, float drc_scale = 0, int cachemode = 1, string cachepath, int cachesize = 100, bint showprogress = True])`
+`bs.AudioSource(string source[, int track = -1, int adjustdelay = -1, int threads = 0, bint enable_drefs = False, bint use_absolute_path = False, float drc_scale = 0, int cachemode = 1, string cachepath, int cachesize = 100, bint showprogress = True, maxdecoders = 0])`
 
-`bs.VideoSource(string source[, int track = -1, int variableformat = -1, int fpsnum = -1, int fpsden = 1, bint rff = False, int threads = 0, int seekpreroll = 20, bint enable_drefs = False, bint use_absolute_path = False, int cachemode = 1, string cachepath , int cachesize = 1000, string hwdevice, int extrahwframes = 9, string timecodes, int start_number, int viewid = 0, bint showprogress = True])`
+`bs.VideoSource(string source[, int track = -1, int variableformat = -1, int fpsnum = -1, int fpsden = 1, bint rff = False, int threads = 0, int seekpreroll = 20, bint enable_drefs = False, bint use_absolute_path = False, int cachemode = 1, string cachepath , int cachesize = 100, string hwdevice, int extrahwframes = 9, string timecodes, int start_number, int viewid = 0, bint showprogress = True, maxdecoders = 0, bool hwfallback = True])`
 
 `bs.TrackInfo(string source[, bint enable_drefs = False, bint use_absolute_path = False])`
 
@@ -62,11 +63,11 @@ The *Metadata* function returns all the file or track metadata as key-value pair
 
 ## Avisynth+ usage
 
-`BSAudioSource(string source[, int track = -1, int adjustdelay = -1, int threads = 0, bool enable_drefs = False, bool use_absolute_path = False, float drc_scale = 0, int cachemode = 1, string cachepath, int cachesize = 100])`
+`BSAudioSource(string source[, int track = -1, int adjustdelay = -1, int threads = 0, bool enable_drefs = False, bool use_absolute_path = False, float drc_scale = 0, int cachemode = 1, string cachepath, int cachesize = 100, int maxdecoders = 0])`
 
-`BSVideoSource(string source[, int track = -1, int fpsnum = -1, int fpsden = 1, bool rff = False, int threads = 0, int seekpreroll = 20, bool enable_drefs = False, bool use_absolute_path = False, int cachemode = 1, string cachepath, int cachesize = 1000, string hwdevice, int extrahwframes = 9, string timecodes, int start_number, int variableformat = 0, int viewid = 0])`
+`BSVideoSource(string source[, int track = -1, int fpsnum = -1, int fpsden = 1, bool rff = False, int threads = 0, int seekpreroll = 20, bool enable_drefs = False, bool use_absolute_path = False, int cachemode = 1, string cachepath, int cachesize = 100, string hwdevice, int extrahwframes = 9, string timecodes, int start_number, int variableformat = 0, int viewid = 0, int maxdecoders = 0, bool hwfallback = True])`
 
-`BSSource(string source[, int atrack = -1, int vtrack = -1, int fpsnum = -1, int fpsden = 1, bool rff = False, int threads = 0, int seekpreroll = 20, bool enable_drefs = False, bool use_absolute_path = False, int cachemode = 1, string cachepath, int acachesize = 100, int vcachesize = 1000, string hwdevice, int extrahwframes = 9, string timecodes, int start_number, int variableformat = 0, int adjustdelay = -1, float drc_scale = 0, int viewid = 0])`
+`BSSource(string source[, int atrack = -1, int vtrack = -1, int fpsnum = -1, int fpsden = 1, bool rff = False, int threads = 0, int seekpreroll = 20, bool enable_drefs = False, bool use_absolute_path = False, int cachemode = 1, string cachepath, int acachesize = 100, int vcachesize = 100, string hwdevice, int extrahwframes = 9, string timecodes, int start_number, int variableformat = 0, int adjustdelay = -1, float drc_scale = 0, int viewid = 0, int maxdecoders = 0, bool hwfallback = True])`
 
 `BSSetDebugOutput(bool enable = False)`
 
@@ -108,7 +109,7 @@ Note that the *BSSource* function by default will silently ignore errors when op
     3 = Always try to read index but only write index to disk when it will make a noticeable difference on subsequent runs and store index files in the absolute path in *cachepath* with track number and index extension appended
     4 = Always try to read and write index to disk and store index files in the absolute path in *cachepath* with track number and index extension appended
 
-*cachepath*: The path where cache files are written. Note that the actual index files are written into subdirectories using based on the source location. Defaults to %LOCALAPPDATA% on Windows and ~/bsindex elsewhere in mode 1 and 2. For mode 3 and 4 it defaults to *source*.
+*cachepath*: The path where cache files are written. Note that the actual index files are written into subdirectories using based on the source location. Defaults to %LOCALAPPDATA% on Windows and $XDG_CACHE_HOME/bsindex if set otherwise ~/bsindex on other operation systems in mode 1 and 2. For mode 3 and 4 it defaults to *source*.
 
 *cachesize*: Maximum internal cache size in MB.
 
@@ -123,5 +124,9 @@ Note that the *BSSource* function by default will silently ignore errors when op
 *viewid*: The view id to output, this is currently only used for some mv-hevc files and is quite rare.
 
 *showprogress*: Print indexing progress as VapourSynth information level log messages.
+
+*maxdecoders*: The maximum number of decoder instances kept around, defaults to 4 but when decoding high resolution content it may be beneficial to reduce it to 1 to reduce peak memory usage. For example 4k h264 material will use approximately 250MB of ram in addition to the specified cache size for decoder instance. Passing a number outside the 1-4 range will set it to the biggest number supported.
+
+*hwfallback*: Automatically fall back to CPU decoding if hardware decoding can't be used for the current video track when *hwdevice* is set. Note that the fallback only happens when a hardware decoder is unavailable and not on any other category of error such as *hwdevice* having an invalid value.
 
 *level*: The log level of the FFmpeg library. By default quiet. See FFmpeg documentation for allowed constants. Mostly useful for debugging purposes.
