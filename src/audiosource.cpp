@@ -299,6 +299,10 @@ static std::array<uint8_t, HashSize> GetHash(const AVFrame *Frame) {
 
 BestAudioSource::Cache::CacheBlock::CacheBlock(int64_t FrameNumber, AVFrame *Frame) : FrameNumber(FrameNumber), Frame(Frame) {
     assert(Frame->nb_samples > 0);
+    for (int i = 0; i < AV_NUM_DATA_POINTERS; i++)
+        if (Frame->buf[i])
+            Size += Frame->buf[i]->size;
+
     for (int i = 0; i < Frame->nb_extended_buf; i++)
         if (Frame->extended_buf[i])
             Size += Frame->extended_buf[i]->size;
@@ -389,7 +393,6 @@ BestAudioSource::BestAudioSource(const std::filesystem::path &SourceFile, int Tr
     InitializeFormatSets();
     SelectFormatSet(-1);
 
-    // FIXME, rework delay adjustment
     if (AjustDelay >= -1)
         SampleDelay = static_cast<int64_t>(GetRelativeStartTime(AjustDelay) * AP.SampleRate);
 
@@ -492,32 +495,17 @@ void BestAudioSource::InitializeFormatSets() {
 }
 
 double BestAudioSource::GetRelativeStartTime(int Track) const {
-    if (Track < 0) {
-        try {
-            std::unique_ptr<LWVideoDecoder> Dec(new LWVideoDecoder(Source, "", 0, Track, 0, 0, LAVFOptions));
-            BSVideoProperties VP;
-            Dec->GetVideoProperties(VP);
-            return AP.StartTime - VP.StartTime;
-        } catch (BestSourceException &) {
-        }
-        return 0;
-    } else {
-        try {
-            std::unique_ptr<LWVideoDecoder> Dec(new LWVideoDecoder(Source, "", 0, Track, 0, 0, LAVFOptions));
-            BSVideoProperties VP;
-            Dec->GetVideoProperties(VP);
-            return AP.StartTime - VP.StartTime;
-        } catch (BestSourceException &) {
-            try {
-                std::unique_ptr<LWAudioDecoder> Dec(new LWAudioDecoder(Source, Track, Threads, LAVFOptions, 0));
-                BSAudioProperties AP2;
-                Dec->GetAudioProperties(AP2);
-                return AP.StartTime - AP2.StartTime;
-            } catch (BestSourceException &) {
-                throw BestSourceException("Can't get delay relative to track");
-            }
-        }
+    try {
+        std::unique_ptr<LWVideoDecoder> Dec(new LWVideoDecoder(Source, "", 0, Track, 0, 0, LAVFOptions));
+        AVFrame *F = Dec->GetNextFrame();
+        int64_t PTS = (F && F->pts != AV_NOPTS_VALUE) ? F->pts : 0;
+        av_frame_unref(F);
+        LWVideoProperties VP;
+        Dec->GetVideoProperties(VP);
+        return AP.StartTime - (static_cast<double>(VP.TimeBase.Num) * PTS) / VP.TimeBase.Den;
+    } catch (BestSourceException &) {
     }
+    return 0;
 }
 
 const BSAudioProperties &BestAudioSource::GetAudioProperties() const {

@@ -41,6 +41,17 @@ extern "C" {
 #include <libavutil/hdr_dynamic_metadata.h>
 }
 
+// Endian detection
+#ifdef _WIN32
+#define BS_LITTLE_ENDIAN
+#elif defined(__BYTE_ORDER__)
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define BS_BIG_ENDIAN
+#elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define BS_LITTLE_ENDIAN
+#endif
+#endif
+
 static bool GetSampleTypeIsFloat(const AVPixFmtDescriptor *Desc) {
     return !!(Desc->flags & AV_PIX_FMT_FLAG_FLOAT);
 }
@@ -68,13 +79,19 @@ static int GetBitDepth(const AVPixFmtDescriptor *Desc) {
     return Desc->comp[0].depth;
 }
 
-static int IsRealPlanar(const AVPixFmtDescriptor *Desc) {
+static int IsRealPlanarNative(const AVPixFmtDescriptor *Desc) {
     if (!!(Desc->flags & AV_PIX_FMT_FLAG_PAL))
         return false;
     int MaxPlane = 0;
     for (int i = 0; i < Desc->nb_components; i++)
         MaxPlane = std::max(MaxPlane, Desc->comp[i].plane);
-    return (MaxPlane + 1) == Desc->nb_components;
+    if ((MaxPlane + 1) != Desc->nb_components)
+        return false;
+#ifdef BS_LITTLE_ENDIAN
+    return (GetBitDepth(Desc) <= 8 || !(Desc->flags & AV_PIX_FMT_FLAG_BE));
+#else
+    return (GetBitDepth(Desc) <= 8 || !!(Desc->flags & AV_PIX_FMT_FLAG_BE));
+#endif
 }
 
 bool LWVideoDecoder::ReadPacket() {
@@ -98,7 +115,8 @@ bool LWVideoDecoder::DecodeNextFrame(bool SkipOutput) {
         if (Ret == 0) {
             if (HWMode) {
                 if (!SkipOutput) {
-                    av_hwframe_transfer_data(DecodeFrame, HWFrame, 0);
+                    if (av_hwframe_transfer_data(DecodeFrame, HWFrame, 0) < 0)
+                        return false;
                     av_frame_copy_props(DecodeFrame, HWFrame);
                 }
             }
@@ -627,8 +645,8 @@ static const std::map<AVPixelFormat, p2p_packing> FormatMap = {
     { AV_PIX_FMT_0BGR, p2p_rgba32_le },
     { AV_PIX_FMT_BGR0, p2p_argb32_le },
 
-    { AV_PIX_FMT_RGB48BE, p2p_bgr48_be },
-    { AV_PIX_FMT_RGB48LE, p2p_bgr48_le },
+    { AV_PIX_FMT_RGB48BE, p2p_rgb48_be },
+    { AV_PIX_FMT_RGB48LE, p2p_rgb48_le },
 
     { AV_PIX_FMT_RGBA64LE, p2p_rgba64_le },
     { AV_PIX_FMT_RGBA64BE, p2p_rgba64_be },
@@ -684,7 +702,7 @@ bool BestVideoFrame::ExportAsPlanar(uint8_t *const *const Dsts1, const ptrdiff_t
 
     if (VF.Bits <= 8)
         BytesPerSample = 1;
-    if (VF.Bits > 8 && VF.Bits <= 16)
+    else if (VF.Bits > 8 && VF.Bits <= 16)
         BytesPerSample = 2;
     else if (VF.Bits > 16 && VF.Bits <= 32)
         BytesPerSample = 4;
@@ -694,7 +712,7 @@ bool BestVideoFrame::ExportAsPlanar(uint8_t *const *const Dsts1, const ptrdiff_t
     if (!BytesPerSample)
         return false;
 
-    if (IsRealPlanar(Desc)) {
+    if (IsRealPlanarNative(Desc)) {
         int NumBasePlanes = (VF.ColorFamily == 1 ? 1 : 3);
         for (int Plane = 0; Plane < NumBasePlanes; Plane++) {
             int PlaneW = SSModWidth;
@@ -844,7 +862,7 @@ static std::array<uint8_t, HashSize> GetHash(const AVFrame *Frame) {
 }
 
 BestVideoSource::Cache::CacheBlock::CacheBlock(int64_t FrameNumber, AVFrame *Frame) : FrameNumber(FrameNumber), Frame(Frame) {
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < AV_NUM_DATA_POINTERS; i++)
         if (Frame->buf[i])
             Size += Frame->buf[i]->size;
 }
@@ -945,7 +963,7 @@ BestVideoSource::BestVideoSource(const std::filesystem::path &SourceFile, const 
 
     if (CacheMode == bcmDisable || !ReadVideoTrackIndex(IsAbsolutePathCacheMode(CacheMode), CachePath)) {
         if (!IndexTrack(Progress))
-            throw BestSourceException("Indexing of '" + Source.u8string() + "' track #" + std::to_string(VideoTrack) + " failed");
+            throw BestSourceException("Indexing of '" + Source.u8string() + "' track #" + std::to_string(VideoTrack) + " failed, if hwdevice is set this may also be an indication that hardware decoding is unsupported");
 
         if (ShouldWriteIndex(CacheMode, TrackIndex.Frames.size())) {
             if (!WriteVideoTrackIndex(IsAbsolutePathCacheMode(CacheMode), CachePath))
@@ -1062,12 +1080,18 @@ bool BestVideoSource::IndexTrack(const ProgressFunction &Progress) {
     bool HasKeyFrames = false;
     bool HasEarlyKeyFrames = false;
     bool HasValidPTS = false;
+    bool OutOfOrderPTS = false;
+    int64_t LastValidPTS = AV_NOPTS_VALUE;
 
     while (true) {
         AVFrame *F = Decoder->GetNextFrame();
         if (!F)
             break;
 
+        if (LastValidPTS != AV_NOPTS_VALUE && F->pts != AV_NOPTS_VALUE && F->pts <= LastValidPTS)
+            OutOfOrderPTS = true;
+        if (F->pts != AV_NOPTS_VALUE)
+            LastValidPTS = F->pts;
         HasValidPTS = HasValidPTS || (F->pts != AV_NOPTS_VALUE);
         HasKeyFrames = HasKeyFrames || !!(F->flags & AV_FRAME_FLAG_KEY);
         if (TrackIndex.Frames.size() < 100)
@@ -1095,12 +1119,30 @@ bool BestVideoSource::IndexTrack(const ProgressFunction &Progress) {
         }
     }
 
+    if (OutOfOrderPTS)
+        BSDebugPrint("Out of order PTS values detected, this should not happen and may indicate a broken file");
+
+    if (!OutOfOrderPTS && HasValidPTS) {
+        // Interpolate missing PTS values for single frame gaps
+        for (size_t i = 1; i < TrackIndex.Frames.size() - 1; i++) {
+            if (TrackIndex.Frames[i - 1].PTS != AV_NOPTS_VALUE && TrackIndex.Frames[i].PTS == AV_NOPTS_VALUE && TrackIndex.Frames[i + 1].PTS != AV_NOPTS_VALUE && TrackIndex.Frames[i + 1].PTS > TrackIndex.Frames[i - 1].PTS)
+                TrackIndex.Frames[i].PTS = (TrackIndex.Frames[i - 1].PTS + TrackIndex.Frames[i + 1].PTS) / 2;
+        }
+
+    }
+
     if (!HasValidPTS) {
         // Probably H264 in AVI
         if (VP.Duration == TrackIndex.Frames.size()) {
             // It's CFR so we know every frame duration is 1 unit
             for (size_t i = 0; i < TrackIndex.Frames.size(); i++)
                 TrackIndex.Frames[i].PTS = i;
+        } else if (VP.Duration == TrackIndex.Frames.size() * 2) {
+            // It's with 99.99% certainty CFR so we almost know every frame duration is 2 units
+            for (size_t i = 0; i < TrackIndex.Frames.size(); i++)
+                TrackIndex.Frames[i].PTS = i * 2;
+        } else {
+            BSDebugPrint("No valid PTS values at all and guessing failed");
         }
     }
 
@@ -1109,6 +1151,25 @@ bool BestVideoSource::IndexTrack(const ProgressFunction &Progress) {
 
 const BSVideoProperties &BestVideoSource::GetVideoProperties() const {
     return VP;
+}
+
+[[nodiscard]] int64_t BestVideoSource::GetOriginalFrameNumber(int64_t N) const {
+    // Adjust frame number if an output format is chosen
+    if (VariableFormat >= 0 && FormatSets.size() > 1) {
+        const auto &ActiveSet = FormatSets[VariableFormat];
+        int64_t UsableFrames = 0;
+        int64_t SourceN = N;
+        for (const auto &Iter : TrackIndex.Frames) {
+            if (Iter.Format != ActiveSet.Format || Iter.Width != ActiveSet.Width || Iter.Height != ActiveSet.Height) {
+                N++;
+            } else {
+                if (UsableFrames++ == SourceN)
+                    break;
+            }
+        }
+    }
+
+    return N;
 }
 
 // Short algorithm summary
@@ -1125,20 +1186,7 @@ BestVideoFrame *BestVideoSource::GetFrame(int64_t N, bool Linear) {
     if (N < 0 || N >= VP.NumFrames)
         return nullptr;
 
-    // Adjust frame number if an output format is chosen
-    if (VariableFormat >= 0 && FormatSets.size() > 1) {
-        const auto &ActiveSet = FormatSets[VariableFormat];
-        int64_t UsableFrames = 0;
-        int64_t SourceN = N;
-        for (const auto &Iter : TrackIndex.Frames) {
-            if (Iter.Format != ActiveSet.Format || Iter.Width != ActiveSet.Width || Iter.Height != ActiveSet.Height) {
-                N++;
-            } else {
-                if (UsableFrames++ == SourceN)
-                    break;
-            }
-        }
-    }
+    N = GetOriginalFrameNumber(N);
 
     std::unique_ptr<BestVideoFrame> F(FrameCache.GetFrame(N));
     if (!F)
@@ -1828,7 +1876,7 @@ void BestVideoSource::WriteTimecodes(const std::filesystem::path &TimecodeFile) 
 }
 
 const BestVideoSource::FrameInfo &BestVideoSource::GetFrameInfo(int64_t N) const {
-    return TrackIndex.Frames[N];
+    return TrackIndex.Frames[GetOriginalFrameNumber(N)];
 }
 
 bool BestVideoSource::GetLinearDecodingState() const {
